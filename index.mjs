@@ -45,6 +45,10 @@ const PROVIDER = "agentrouter";
 // the account signed in to, so they do not move with this default.
 const ENDPOINT = "https://ps.air-outer.com";
 
+// Billing stays on the original front door: it is the account's own dashboard
+// route, so moving the model endpoint must not move the usage read with it.
+const BILLING_ENDPOINT = "https://agentrouter.org";
+
 const SITES = {
   // The vendor runs two front doors for the same accounts. `api` is the
   // request endpoint a site serves; `site` is where its web routes are.
@@ -183,6 +187,17 @@ function apiBase(provider, auth) {
   const base = String(meta(auth, "apiBase") ?? "").trim();
   if (base) return base.replace(/\/+$/, "");
   return `${ENDPOINT}/v1`;
+}
+
+// billingBase is where the key's cumulative-usage read goes. It honours an
+// explicit endpoint or apiBase (a user pointing at their own relay), and
+// otherwise keeps the original front door rather than the model default.
+function billingBase(provider, auth) {
+  const said = String(meta(auth, "endpoint") ?? provider?.endpoint ?? "").trim();
+  if (isURLish(said)) return `${said.replace(/\/+$/, "")}/v1`;
+  const base = String(meta(auth, "apiBase") ?? "").trim();
+  if (base) return base.replace(/\/+$/, "");
+  return `${BILLING_ENDPOINT}/v1`;
 }
 
 // siteBase is where the site's own web routes are: the balance and the
@@ -604,7 +619,7 @@ async function spendOf(provider, auth) {
   }
   if (apiKey(auth)) {
     reads.push({
-      url: `${apiBase(provider, auth)}/dashboard/billing/usage`,
+      url: `${billingBase(provider, auth)}/dashboard/billing/usage`,
       headers: { ...headersOf(provider, auth), Authorization: `Bearer ${apiKey(auth)}` },
       field: "total_usage",
       divisor: 100,
@@ -1322,6 +1337,7 @@ export const _internal = {
   headersOf,
   applyHeaders,
   apiBase,
+  billingBase,
   siteBase,
   userHeaders,
   masked,

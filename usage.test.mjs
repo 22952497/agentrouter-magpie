@@ -58,7 +58,19 @@ test('A key pasted into the endpoint question is refused there and ignored at re
     { key: 'sk-example', metadata: { endpoint: 'sk-example' } },
     [json({ total_usage: 0 })],
   );
-  assert.equal(calls[0].url, 'https://ps.air-outer.com/v1/dashboard/billing/usage');
+  assert.equal(calls[0].url, 'https://agentrouter.org/v1/dashboard/billing/usage');
+});
+
+test('Billing keeps the original front door while model requests default to ps.air-outer.com', () => {
+  // Moving the model endpoint must not move the account's usage read with it:
+  // the dashboard route belongs to the original site, and a silent change here
+  // would make consumption vanish from the quota report.
+  assert.equal(_internal.apiBase({}, {}), 'https://ps.air-outer.com/v1');
+  assert.equal(_internal.billingBase({}, {}), 'https://agentrouter.org/v1');
+  // An explicit endpoint still wins for both, so a user's own relay is kept.
+  const own = { metadata: { endpoint: 'https://relay.example' } };
+  assert.equal(_internal.apiBase({}, own), 'https://relay.example/v1');
+  assert.equal(_internal.billingBase({}, own), 'https://relay.example/v1');
 });
 
 test('The Codex headers are sent unless the provider switch is turned off', async () => {
