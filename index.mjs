@@ -39,10 +39,11 @@
 
 const PROVIDER = "agentrouter";
 
-// The request endpoint: where completions and the model list go. This is the
-// one the user picked, and it stays what they picked even when the site the
-// check-in talks to is the other front door. A site's own API lives under it.
-const ENDPOINT = "https://agentrouter.org";
+// The request endpoint: where completions and the model list go by default.
+// It points at the ps.air-outer.com front door, which serves the same accounts.
+// A site's own web routes (sign-in, check-in, balance) still follow the site
+// the account signed in to, so they do not move with this default.
+const ENDPOINT = "https://ps.air-outer.com";
 
 const SITES = {
   // The vendor runs two front doors for the same accounts. `api` is the
@@ -169,9 +170,9 @@ function isURLish(v) {
 }
 
 // apiBase is the base completions go to. It follows the account's own
-// endpoint when it gave one, and otherwise the endpoint this plugin was built
-// for — never the check-in site, so picking ps.air-outer.com for the check-in
-// doesn't quietly move requests off agentrouter.org.
+// endpoint when it gave one, and otherwise defaults to the ps.air-outer.com
+// front door. The sign-in site is separate, so choosing agentrouter.org for
+// check-in and balance does not move model requests back off that default.
 //
 // A stored endpoint that isn't a URL is ignored rather than used: the
 // request then still goes to the vendor, which is what the account wanted

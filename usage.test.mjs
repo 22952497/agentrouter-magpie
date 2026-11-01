@@ -58,7 +58,7 @@ test('A key pasted into the endpoint question is refused there and ignored at re
     { key: 'sk-example', metadata: { endpoint: 'sk-example' } },
     [json({ total_usage: 0 })],
   );
-  assert.equal(calls[0].url, 'https://agentrouter.org/v1/dashboard/billing/usage');
+  assert.equal(calls[0].url, 'https://ps.air-outer.com/v1/dashboard/billing/usage');
 });
 
 test('The Codex headers are sent unless the provider switch is turned off', async () => {
