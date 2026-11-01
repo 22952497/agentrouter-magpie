@@ -1,4 +1,4 @@
-# AgentRouter 插件（agentrouter-magpie）
+# agentrouter
 
 给 magpie / OpenCode 接入 [agentrouter.org](https://agentrouter.org/)：模型调用、余额与用量、每日签到、可自定义请求头。单文件 `index.mjs`，零依赖 ESM。
 
