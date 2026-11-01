@@ -1,0 +1,24 @@
+# 依赖与构建产物
+node_modules/
+.codegraph/
+*.tgz
+
+# 本地凭据 —— 绝不提交
+plugin-auth.json
+.credentials*
+.env
+.env.*
+*.key
+*.pem
+
+# 抓包与临时文件
+verify-live.mjs
+verify-local.mjs
+.scan-*.py
+*.bak-*
+*.json.bak
+r.json
+c.json
+*.log
+.DS_Store
+Thumbs.db
