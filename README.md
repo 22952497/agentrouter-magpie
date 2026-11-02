@@ -103,6 +103,41 @@ magpie 的余额缓存保存在 `<magpie 配置目录>/agentrouter-balance-cache
 | 余额显示旧值 | 网站未就绪、验证码或读取失败时保留缓存 | 看卡片中「缓存」后的读取时间 |
 | 用户 ID 不一致 | 备用登录用户名对应了另一个账号 | 核对该账号的用户 ID 和登录用户名 |
 | 所有模型无响应且无报错 | 旧版把 `sk-…` 存进了 endpoint | 本版已修，重新保存即可 |
+| `read ECONNRESET` / `connect ETIMEDOUT` | 出网链路不通，或本地代理节点已失效 | 见下方「网络层排查」 |
+
+### 网络层排查
+
+`ECONNRESET` 和 `ETIMEDOUT` 都发生在 TCP 层，与密钥、模型、请求体清理无关。先分清是哪一跳断的，再去改配置，否则会误判成网关拒绝。
+
+`agentrouter.org` 在部分网络环境下无法直连，需要经本机 HTTP 代理出网。判断方法：
+
+```bash
+# 1) 基础网络是否正常（换任意可达站点）
+curl -s -o /dev/null -w "%{http_code}\n" https://www.baidu.com
+
+# 2) 出网代理是否正常
+curl -s -o /dev/null -w "%{http_code}\n" \
+  --proxy http://127.0.0.1:3067 \
+  https://agentrouter.org/api/status
+```
+
+| 第 1 条 | 第 2 条 | 结论 |
+|---|---|---|
+| 200 | 200 | 链路正常，问题在请求或网关 |
+| 200 | `000` | **代理节点失效**，在代理客户端里切换节点 |
+| `000` | `000` | 本机出网断了，先恢复网络 |
+
+第 2 条返回 `000` 而第 1 条是 200，是最容易被误判的情况：端口在监听，但上游节点已断，表现为代理连不上而不是报错。此时任何请求都会得到 `ECONNRESET`，重试也不会好。
+
+代理客户端若提供多个本地端口，逐个测一遍能快速定位可用端口：
+
+```bash
+for p in 3067 3066 3057 1038; do
+  printf "port %s -> " "$p"
+  curl -s -o /dev/null -w "%{http_code}\n" --proxy "http://127.0.0.1:$p" \
+    https://agentrouter.org/api/status
+done
+```
 
 ## License
 
