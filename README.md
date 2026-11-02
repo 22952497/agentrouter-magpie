@@ -50,7 +50,8 @@ docker exec magpie magpie quota agentrouter
 ## 行为要点
 
 - **请求头**：网关只认自家客户端标识，浏览器 UA / `curl` 会 401。插件默认发 `codex_cli_rs`，可在 provider 或账号级 `headers` 覆盖（一行一个 `Name: value`）。
-- **余额**：读不到剩余额度时只显示「累计消耗 $…；剩余额度未知」，不虚构 0%。
+- **余额缓存**：按站点、用户 ID 和凭据分别保存上次完整读数，重启后仍可使用。网站加载时返回的 `quota: 0 / used_quota: 0`、验证码或查询失败不会覆盖缓存；卡片会注明「缓存」及读取时间。正常读数立即更新，`quota: 0` 且有历史消耗仍会显示真实的零余额。没有缓存时显示「余额仍在加载」或「累计消耗 $…；剩余额度未知」。
+- **登录后查余额**：登录响应的两个额度字段都为零时，用刚登录得到的 session 再读正式余额接口；返回的用户 ID 必须与账号配置一致。
 - **签到 = 登录一次**：站点在登录时发额度；需要站点用户名 + 密码，GitHub 登录的账号可能没有密码。
 - **协议**：只有 `/v1/responses`，不支持 `/v1/chat/completions`（由 magpie 网关翻译）。
 - **内容过滤的 400 ≠ 限流**：`code:"content-blocked"` 是某些词 / 自指句式被拦，改写那句话才过；插件会改写说明，避免被误当 429 重试或转移。
@@ -83,6 +84,8 @@ docker exec magpie magpie quota agentrouter
 
 改完重启 magpie。改请求头可用 `./set-ar-headers.sh 'User-Agent: codex_cli_rs/0.101.0'`（传 `''` 清空）。
 
+magpie 的余额缓存保存在 `<magpie 配置目录>/agentrouter-balance-cache/`；OpenCode 使用 `${XDG_CACHE_HOME:-~/.cache}/magpie/agentrouter-balance-cache/`。文件只保存额度、账号显示名和读取时间，不保存 API key、访问令牌、Cookie 或密码。缓存表示上次读数，实际余额以网站完成加载后的结果为准。
+
 ## 文件
 
 - `index.mjs` — 插件本体
@@ -96,7 +99,9 @@ docker exec magpie magpie quota agentrouter
 |---|---|---|
 | `/v1` 一律 401 unauthorized client detected | 自定义头里放了浏览器 UA | 清掉该头，用默认 |
 | 某模型 503 无可用渠道 | 面板列的是已下架模型 | 用站点真实模型列表或关掉该模型 |
-| 余额显示旧值 | 读取失败时保留上次成功读数 | 看 `asOf` 时间 |
+| 刷新后短暂出现零余额 | 网站的两个额度字段尚未加载 | 自动保留上次完整读数，稍后刷新 |
+| 余额显示旧值 | 网站未就绪、验证码或读取失败时保留缓存 | 看卡片中「缓存」后的读取时间 |
+| 用户 ID 不一致 | 备用登录用户名对应了另一个账号 | 核对该账号的用户 ID 和登录用户名 |
 | 所有模型无响应且无报错 | 旧版把 `sk-…` 存进了 endpoint | 本版已修，重新保存即可 |
 
 ## License

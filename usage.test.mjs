@@ -1,9 +1,22 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { randomUUID } from 'node:crypto';
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { basename, join, relative, resolve } from 'node:path';
+import { after, test } from 'node:test';
 import { AgentRouterAuthPlugin, _internal } from './index.mjs';
 
 const plugin = await AgentRouterAuthPlugin();
 const json = (body, status = 200) => new Response(JSON.stringify(body), { status });
+const testDirectory = await mkdtemp(join(tmpdir(), 'agentrouter-test-'));
+after(async () => {
+  const withinTemp = relative(resolve(tmpdir()), resolve(testDirectory));
+  assert.ok(withinTemp && !withinTemp.startsWith('..') && basename(testDirectory).startsWith('agentrouter-test-'));
+  await rm(testDirectory, { recursive: true, force: true });
+});
+const cachePlugin = (directory = join(testDirectory, randomUUID())) => AgentRouterAuthPlugin({
+  project: { id: 'magpie' }, directory,
+});
 
 const apiMethod = (p) => p.auth.methods.find((m) => m.type === 'api');
 const prompt = (p, key) => apiMethod(p).prompts.find((x) => x.key === key);
@@ -237,17 +250,23 @@ test('Any other refusal is passed through untouched', async () => {
   }
 });
 
-async function readUsage(auth, responses, provider = {}) {
+async function readUsage(auth, responses, provider = {}, target = undefined) {
   const original = globalThis.fetch;
   const calls = [];
+  const unexpected = [];
+  const currentPlugin = target ?? await cachePlugin();
   globalThis.fetch = async (url, init) => {
     calls.push({ url, ...init });
     const response = responses.shift();
+    if (!response) unexpected.push(url);
     assert.ok(response, `Unexpected request: ${url}`);
     return response;
   };
   try {
-    return { usage: await plugin.auth.usage(async () => auth, provider), calls };
+    const usage = await currentPlugin.auth.usage(async () => auth, provider);
+    assert.deepEqual(unexpected, [], 'The balance recovery must make only its bounded requests');
+    assert.equal(responses.length, 0, 'All expected reads were made');
+    return { usage, calls };
   } finally {
     globalThis.fetch = original;
   }
@@ -323,6 +342,112 @@ test('Malformed account and billing amounts stay unknown', async () => {
   );
   assert.match(usage.error, /没有返回额度字段/);
   assert.equal(usage.balance, undefined);
+});
+
+test('A loading zero never replaces the cached balance, including after a host restart', async () => {
+  const directory = join(testDirectory, randomUUID());
+  const current = await cachePlugin(directory);
+  const auth = { key: 'sk-cache-secret', metadata: { accessToken: 'token-cache-secret', userId: '123' } };
+  const full = { success: true, data: { id: 123, username: 'example', quota: 75000000, used_quota: 25000000 } };
+  const pending = { success: true, data: { id: 123, quota: 0, used_quota: 0 } };
+  const first = await readUsage(auth, [json(full)], {}, current);
+  assert.equal(first.usage.balance, '$150.00');
+
+  const second = await readUsage(auth, [json(pending), json(pending)], {}, current);
+  assert.equal(second.usage.balance, '$150.00');
+  assert.equal(second.usage.windows[0].used, 25);
+  assert.match(second.usage.windows[0].display, /缓存.*网站余额仍在加载/);
+  assert.equal(second.usage.error, undefined);
+
+  const restarted = await cachePlugin(directory);
+  const restored = await readUsage(auth, [json(pending), json(pending)], {}, restarted);
+  assert.equal(restored.usage.balance, '$150.00');
+  assert.equal(restored.usage.windows[0].display, second.usage.windows[0].display);
+
+  const files = await readdir(join(directory, 'agentrouter-balance-cache'));
+  assert.equal(files.length, 1);
+  assert.match(files[0], /^[a-f0-9]{64}\.json$/);
+  const contents = await readFile(join(directory, 'agentrouter-balance-cache', files[0]), 'utf8');
+  assert.doesNotMatch(contents, /sk-cache-secret|token-cache-secret|password|cookie/);
+  assert.ok(Number.isFinite(Date.parse(JSON.parse(contents).at)));
+});
+
+test('A ready response updates the cache and real exhaustion is not hidden', async () => {
+  const current = await cachePlugin();
+  const auth = { metadata: { accessToken: 'example', userId: '456' } };
+  await readUsage(auth, [json({ success: true, data: { id: 456, quota: 5000000, used_quota: 1000000 } })], {}, current);
+  const pending = json({ success: true, data: { id: 456, quota: 0, used_quota: 0 } });
+  const recovered = await readUsage(auth, [pending, json({ success: true, data: { id: 456, quota: 2500000, used_quota: 3500000 } })], {}, current);
+  assert.equal(recovered.usage.balance, '$5.00');
+  assert.doesNotMatch(recovered.usage.windows[0].display, /缓存/);
+
+  const exhausted = await readUsage(auth, [json({ success: true, data: { id: 456, quota: 0, used_quota: 6000000 } })], {}, current);
+  assert.equal(exhausted.usage.balance, '$0.00');
+  assert.equal(exhausted.usage.windows[0].used, 100);
+  assert.equal(exhausted.usage.windows[0].remaining, 0);
+  const stillZero = await readUsage(auth, [json({ success: false, message: 'temporarily unavailable' })], {}, current);
+  assert.equal(stillZero.usage.balance, '$0.00');
+  assert.match(stillZero.usage.windows[0].display, /缓存/);
+});
+
+test('Login loading values use the new session to read the real balance', async () => {
+  const auth = { metadata: { userId: '123', username: 'example', password: 'example' } };
+  const login = new Response(JSON.stringify({ success: true, data: { id: 123, quota: 0, used_quota: 0 } }), {
+    headers: { 'Set-Cookie': 'session=fresh; Path=/; HttpOnly' },
+  });
+  const { usage, calls } = await readUsage(auth, [login, json({ success: true, data: { id: 123, quota: 5000000, used_quota: 1000000 } })]);
+  assert.equal(usage.balance, '$10.00');
+  assert.ok(calls[0].url.endsWith('/api/user/login'));
+  assert.ok(calls[1].url.endsWith('/api/user/self'));
+  assert.equal(calls[1].headers.Cookie, 'session=fresh');
+  assert.equal(calls[1].headers['New-Api-User'], '123');
+  assert.equal(auth.cookie, undefined);
+});
+
+test('Blocked reads and a still-loading login keep the previous balance', async () => {
+  const current = await cachePlugin();
+  const auth = { metadata: { accessToken: 'example', userId: '123', username: 'example', password: 'example' } };
+  await readUsage(auth, [json({ success: true, data: { id: 123, quota: 5000000, used_quota: 1000000 } })], {}, current);
+  const { usage } = await readUsage(auth, [
+    new Response('<html>captcha</html>'),
+    json({ success: true, data: { id: 123, quota: 0, used_quota: 0 } }),
+    new Response('<html>captcha</html>'),
+  ], {}, current);
+  assert.equal(usage.balance, '$10.00');
+  assert.match(usage.windows[0].display, /缓存.*网站余额仍在加载/);
+});
+
+test('Uncached loading responses say unknown rather than zero or 100% remaining', async () => {
+  const pending = { success: true, data: { id: 123, quota: 0, used_quota: 0 } };
+  const { usage } = await readUsage({ metadata: { accessToken: 'example', userId: '123' } }, [json(pending), json(pending), json({ success: false })]);
+  assert.equal(usage.balance, undefined);
+  assert.deepEqual(usage.windows, []);
+  assert.match(usage.error, /余额仍在加载.*尚无本地缓存/);
+});
+
+test('Different accounts, corrected IDs and sites never share a cached balance', async () => {
+  const current = await cachePlugin();
+  const first = { key: 'sk-first', metadata: { accessToken: 'example', userId: '123' } };
+  await readUsage(first, [json({ success: true, data: { id: 123, quota: 5000000, used_quota: 1000000 } })], {}, current);
+  for (const auth of [
+    { key: 'sk-second', metadata: { accessToken: 'example', userId: '123' } },
+    { key: 'sk-first', metadata: { accessToken: 'example', userId: '456' } },
+    { key: 'sk-first', metadata: { accessToken: 'example', userId: '123', site: 'air' } },
+  ]) {
+    const { usage } = await readUsage(auth, [json({ success: true, data: {} }), json({ success: false }), json({ total_usage: 0 })], {}, current);
+    assert.equal(usage.balance, undefined);
+    assert.match(usage.error, /剩余额度未知/);
+  }
+});
+
+test('A different login account cannot replace the cached account', async () => {
+  const current = await cachePlugin();
+  const auth = { metadata: { accessToken: 'example', userId: '123', username: 'example', password: 'example' } };
+  await readUsage(auth, [json({ success: true, data: { id: 123, username: 'first', quota: 5000000, used_quota: 1000000 } })], {}, current);
+  const { usage } = await readUsage(auth, [new Response('<html>captcha</html>'), json({ success: true, data: { id: 456, username: 'other', quota: 75000000, used_quota: 25000000 } })], {}, current);
+  assert.equal(usage.balance, '$10.00');
+  assert.equal(usage.plan, 'first');
+  assert.match(usage.windows[0].display, /缓存.*用户 ID 不一致/);
 });
 
 // ---- request body: dropping Azure node-bound state -------------------------

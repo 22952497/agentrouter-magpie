@@ -25,8 +25,10 @@
 // 3. /api/user/self reports quota and used_quota, but often returns an
 //    Aliyun slider-captcha page instead. Try it with an access token or
 //    browser session; neither credential guarantees passage through WAF.
-//    A password sign-in can also return the current user record and grant
-//    the day's credit. GitHub accounts may have no site password.
+//    A password sign-in grants the day's credit and can return a user record,
+//    but the site may still be loading its quota: both counters then say zero.
+//    Keep the last complete reading until the user endpoint is ready again.
+//    GitHub accounts may have no site password.
 //
 //    Without a password, what is left is the spend: /api/log/self/stat
 //    answers a session or an access token with the account's used quota,
@@ -36,6 +38,11 @@
 //
 // Signing in with only the key is allowed. It can read consumption, but
 // cannot determine remaining credit or perform password check-in.
+
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 const PROVIDER = "agentrouter";
 
@@ -97,6 +104,7 @@ let codexHeaders = () => true;
 
 const REQUEST_TIMEOUT = 30_000;
 const CHECKIN_TIMEOUT = 25_000;
+const BALANCE_TIMEOUT = 15_000;
 
 const siteOf = (id) => SITES[id] ?? SITES.org;
 
@@ -494,21 +502,10 @@ async function keyOf(base, token, id) {
   }
 }
 
-// signIn is one POST to the site's login route, and it is the whole feature:
-// the login response carries both the day's check-in and the balance.
-//
-// The vendor grants its daily credit at sign-in rather than through a route
-// of its own — its front end says "签到成功，新增额度已到账" when the login
-// response has checked_in — and that same response carries quota and
-// used_quota, the account's balance. So one call does both jobs, and it is
-// also the only way to read the balance from a server: /api/user/self, the
-// route New API normally reads it from, is the one this site's WAF answers
-// with a slider captcha, while /api/user/login is left alone.
-//
-// It answers {ok, checkedIn?, balance?, why?}. The caller decides whether a
-// false `ok` is the account's to fix (wrong password) or nobody's (the site
-// is down), so the reasons stay distinguishable here.
-async function signIn(provider, auth) {
+// Signing in is the site's check-in. Its response can precede the quota
+// loading, so a successful sign-in is not necessarily a balance reading.
+// Keep its new session for a follow-up user read, never in the balance cache.
+async function signIn(provider, auth, signal = withTimeout(REQUEST_TIMEOUT)) {
   const user = String(meta(auth, "username") ?? "").trim();
   const pass = String(meta(auth, "password") ?? "");
   if (!user || !pass) return { ok: false, why: "no-password" };
@@ -521,7 +518,7 @@ async function signIn(provider, auth) {
       method: "POST",
       headers: h,
       body: JSON.stringify({ username: user, password: pass }),
-      signal: withTimeout(REQUEST_TIMEOUT),
+      signal,
     });
   } catch (e) {
     return { ok: false, why: `unreachable: ${e?.message ?? String(e)}` };
@@ -540,26 +537,63 @@ async function signIn(provider, auth) {
     return { ok: false, why: msg || "refused", message: msg };
   }
   const d = json.data ?? {};
-  const quota = quotaNumber(d.quota);
-  const used = quotaNumber(d.used_quota);
-  const balance =
-    Number.isFinite(quota) && Number.isFinite(used)
-      ? { quota, used, name: d.username ?? d.display_name ?? "" }
-      : undefined;
-  if (balance) balance.total = balance.quota + balance.used;
+  const reading = balanceRecord(d, auth);
+  if (reading.mismatch) return reading;
+  const session = sessionOf(res);
   // `checked_in: true` means *this* sign-in granted the day's credit. A false
   // means the day was already claimed, which is not a failure.
-  return { ok: true, checkedIn: d.checked_in === true, balance, name: d.username ?? d.display_name ?? "" };
+  return {
+    ok: true,
+    checkedIn: d.checked_in === true,
+    balance: reading.balance,
+    pending: reading.pending,
+    cookie: session ? `session=${session}` : "",
+    userId: String(d.id ?? ""),
+    name: d.username ?? d.display_name ?? "",
+  };
 }
 
-// Try the read-only user endpoint first, then password sign-in. Preserve
-// the failure reason when neither returns a complete quota record.
+// A quota of zero with historical use is a real exhausted balance. Two zero
+// counters are the site's loading state: neither a balance nor 100% remaining.
+function balanceRecord(d, auth) {
+  if (userId(auth) && d.id != null && String(d.id) !== userId(auth)) {
+    return { ok: false, why: "wrong-user", mismatch: true };
+  }
+  const quota = quotaNumber(d.quota);
+  const used = quotaNumber(d.used_quota);
+  if (!Number.isFinite(quota) || !Number.isFinite(used)) return { ok: false, why: "no-quota" };
+  if (quota === 0 && used === 0) return { ok: false, why: "pending", pending: true };
+  return {
+    ok: true,
+    balance: { quota, used, total: quota + used, name: d.username ?? d.display_name ?? "" },
+  };
+}
+
+// Ask the user endpoint first, then sign in if necessary. After a loading
+// response ask the user endpoint once more; a later refresh tries again if
+// the site is still not ready. All balance recovery shares one time budget.
 async function balance(provider, auth) {
-  const viaToken = await balanceByToken(provider, auth);
+  const signal = withTimeout(BALANCE_TIMEOUT);
+  const viaToken = await balanceByToken(provider, auth, signal);
   if (viaToken.ok) return viaToken;
-  const viaLogin = await signIn(provider, auth);
+  if (viaToken.mismatch) return viaToken;
+  if (viaToken.pending) {
+    const again = await balanceByToken(provider, auth, signal);
+    return again.ok || again.mismatch ? again : viaToken;
+  }
+  const viaLogin = await signIn(provider, auth, signal);
   if (viaLogin.ok && viaLogin.balance) return { ok: true, balance: viaLogin.balance };
-  if (viaLogin.ok) return { ok: false, why: "no-quota" };
+  if (viaLogin.ok) {
+    const signedInAuth = {
+      ...auth,
+      ...(viaLogin.cookie ? { cookie: viaLogin.cookie } : {}),
+      userId: userId(auth) || viaLogin.userId,
+    };
+    const again = await balanceByToken(provider, signedInAuth, signal);
+    if (again.ok || again.mismatch) return again;
+    if (viaLogin.pending || again.pending) return { ok: false, why: "pending", pending: true };
+    return again.why === "no-token" ? { ok: false, why: "no-quota" } : again;
+  }
   // Report the reason the user can act on: a wrong password outranks a
   // captcha, and a missing password means the token route's failure is the
   // real one.
@@ -569,12 +603,12 @@ async function balance(provider, auth) {
 }
 
 // Read /api/user/self with either an access token or a browser session.
-async function balanceByToken(provider, auth) {
+async function balanceByToken(provider, auth, signal = withTimeout(REQUEST_TIMEOUT)) {
   if (!userToken(auth) && !parseCookies(cookieText(auth))) return { ok: false, why: "no-token" };
   try {
     const res = await fetch(`${siteBase(provider, auth)}/api/user/self`, {
       headers: userHeaders(provider, auth),
-      signal: withTimeout(REQUEST_TIMEOUT),
+      signal,
     });
     const { json, text } = await jsonOrText(res);
     // New API answers 200 with success:false for a token it refuses, so the
@@ -595,11 +629,7 @@ async function balanceByToken(provider, auth) {
       }
       return { ok: false, why: String(text).slice(0, 80) };
     }
-    const d = json.data ?? {};
-    const quota = quotaNumber(d.quota);
-    const used = quotaNumber(d.used_quota);
-    if (!Number.isFinite(quota) || !Number.isFinite(used)) return { ok: false, why: "no-quota" };
-    return { ok: true, balance: { quota, used, total: quota + used, name: d.username ?? d.display_name ?? "" } };
+    return balanceRecord(json.data ?? {}, auth);
   } catch (e) {
     return { ok: false, why: `unreachable: ${e?.message ?? String(e)}` };
   }
@@ -651,18 +681,78 @@ function quotaRate(provider) {
   return Number.isFinite(rate) && rate > 0 ? rate : 500000;
 }
 
+// Separate files avoid two accounts (or a CLI and the running gateway)
+// replacing each other's readings. The filename is a digest of the site's
+// account identity; the file contains only quota counters and the read time.
+function balanceCache(input) {
+  const directory = input?.project?.id === "magpie" && input?.directory
+    ? join(input.directory, "agentrouter-balance-cache")
+    : join(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"), "magpie", "agentrouter-balance-cache");
+  const memory = new Map();
+  const keyOf = (provider, auth) => createHash("sha256").update(JSON.stringify([
+    siteBase(provider, auth),
+    userId(auth),
+    apiKey(auth) || userToken(auth) || cookieText(auth) || String(meta(auth, "username") ?? ""),
+  ])).digest("hex");
+  const load = async (key) => {
+    try {
+      const saved = JSON.parse(await readFile(join(directory, `${key}.json`), "utf8"));
+      const b = saved?.balance;
+      if (saved.version === 1 && Number.isFinite(Date.parse(saved.at)) && b &&
+          Number.isFinite(b.quota) && Number.isFinite(b.used) && !(b.quota === 0 && b.used === 0)) {
+        const current = memory.get(key);
+        if (!current || Date.parse(saved.at) > Date.parse(current.at)) memory.set(key, saved);
+      }
+    } catch {
+      // A missing/unreadable cache never prevents a live balance query.
+    }
+    return memory.get(key);
+  };
+  const save = async (key, value, startedAt) => {
+    const current = await load(key);
+    if (current && Date.parse(current.at) > startedAt) return current;
+    const entry = {
+      version: 1,
+      at: new Date(startedAt).toISOString(),
+      balance: { quota: value.quota, used: value.used, name: value.name },
+    };
+    memory.set(key, entry);
+    const temporary = join(directory, `${key}.${randomUUID()}.tmp`);
+    try {
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      await writeFile(temporary, `${JSON.stringify(entry)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+      await rename(temporary, join(directory, `${key}.json`));
+    } catch {
+      // Keep the in-memory reading when disk is temporarily unavailable.
+    } finally {
+      await unlink(temporary).catch(() => {});
+    }
+    return entry;
+  };
+  return { keyOf, load, save };
+}
+
 // magpie cannot show a percent-free consumption window. Use its text status
 // for partial data so spend never becomes a balance or an invented 0% window.
-async function usageOf(getAuth, provider) {
+async function usageOf(getAuth, provider, cache) {
   const auth = await getAuth();
   if (!auth) return { windows: [] };
+  const startedAt = Date.now();
+  const key = cache.keyOf(provider, auth);
+  const previous = await cache.load(key);
   const b = await balance(provider, auth);
   if (!b.ok) {
+    // Load again: another magpie process may have read the account meanwhile.
+    const saved = await cache.load(key) || previous;
+    if (saved) return balanceUsage(saved.balance, provider, saved.at, b);
     const spend = await spendOf(provider, auth);
     if (spend.ok) {
       const reason = b.blocked
         ? "余额接口被滑动验证码拦截"
-        : b.expired ? "站点拒绝了余额查询凭据，请核对用户名密码或访问令牌" : "余额接口未返回可用余额";
+        : b.expired ? "站点拒绝了余额查询凭据，请核对用户名密码或访问令牌"
+        : b.pending ? "网站余额仍在加载，稍后刷新"
+        : b.mismatch ? "登录返回的用户 ID 与配置不一致"
+        : "余额接口未返回可用余额";
       return {
         error: `AgentRouter：累计消耗 $${spend.spent.toFixed(2)}；剩余额度未知（${reason}）。读取余额需有效的 Cookie/访问令牌和用户 ID，或站点用户名密码；Cookie 不能保证通过验证码`,
         windows: [],
@@ -673,14 +763,22 @@ async function usageOf(getAuth, provider) {
         ? "AgentRouter：站点拒绝了凭据，请核对用户名密码、访问令牌或 Cookie 及用户 ID"
         : b.blocked
           ? "AgentRouter：余额接口被滑动验证码拦截，剩余额度未知。Cookie 不能保证通过验证码；可尝试有效的站点用户名密码读取余额"
-          : b.why === "no-token"
-            ? "AgentRouter：账号里没有访问令牌，也没有浏览器 Cookie，无法读取余额（个人设置 → 访问令牌）"
-            : b.why === "no-quota"
-              ? "AgentRouter：站点没有返回额度字段"
-              : `AgentRouter：无法读取余额（${b.why}）`;
+          : b.pending
+            ? "AgentRouter：网站余额仍在加载，尚无本地缓存，请稍后刷新"
+            : b.mismatch
+              ? "AgentRouter：登录返回的用户 ID 与配置不一致，请核对账号的用户 ID 和登录用户名"
+              : b.why === "no-token"
+                ? "AgentRouter：账号里没有访问令牌，也没有浏览器 Cookie，无法读取余额（个人设置 → 访问令牌）"
+                : b.why === "no-quota"
+                  ? "AgentRouter：站点没有返回额度字段"
+                  : `AgentRouter：无法读取余额（${b.why}）`;
     return { error: why, windows: [] };
   }
-  const bal = b.balance;
+  const saved = await cache.save(key, b.balance, startedAt);
+  return balanceUsage(saved.balance, provider);
+}
+
+function balanceUsage(bal, provider, cachedAt, failure) {
   // The site counts in 1/500000 dollars unless it says otherwise.
   const rate = quotaRate(provider);
   const dollars = (n) => Math.round((n / rate) * 100) / 100;
@@ -696,9 +794,12 @@ async function usageOf(getAuth, provider) {
   // magpie shows counts.
   const left = dollars(bal.quota);
   const spent = dollars(bal.used);
-  const whole = dollars(bal.total);
+  const whole = dollars(bal.quota + bal.used);
   const usedPct = whole > 0 ? Math.min(100, Math.max(0, (spent / whole) * 100)) : 0;
   const remainingPct = Math.max(0, 100 - usedPct);
+  const cached = cachedAt
+    ? `（缓存 ${new Date(cachedAt).toLocaleString("zh-CN", { hour12: false })}；${failure?.pending ? "网站余额仍在加载" : failure?.mismatch ? "用户 ID 不一致" : "本次读取未成功"}）`
+    : "";
 
   return {
     plan: bal.name || undefined,
@@ -711,7 +812,7 @@ async function usageOf(getAuth, provider) {
         amount: spent,
         limit: whole,
         unit: "usd",
-        display: `$${left.toFixed(2)} / $${whole.toFixed(2)}`,
+        display: `$${left.toFixed(2)} / $${whole.toFixed(2)}${cached}`,
       },
     ],
   };
@@ -1105,6 +1206,7 @@ export const AgentRouterAuthPlugin = async (input) => {
   // 请求头"). Reading it through a closure keeps headersOf's own signature —
   // provider and account — which every caller already passes.
   codexHeaders = () => input?.magpie?.option?.(PROVIDER, "send-codex-headers") !== false;
+  const cache = balanceCache(input);
   return {
     // The provider before anyone signs in: the models the vendor serves, so the
     // row has something to show, and the shape each listed one takes.
@@ -1296,7 +1398,7 @@ export const AgentRouterAuthPlugin = async (input) => {
         };
       },
 
-      usage: usageOf,
+      usage: (getAuth, provider) => usageOf(getAuth, provider, cache),
       checkin: checkinOf,
 
       // Switches the user can turn on the provider's editor.
